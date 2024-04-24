@@ -29,7 +29,7 @@ class TemplatedAttentionHOP(HigherOrderOperator):
         value: torch.Tensor,
         score_mod: Callable,
         *other_buffers: torch.Tensor,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not all(isinstance(buf, torch.Tensor) for buf in other_buffers):
             raise RuntimeError("Other buffers must be tensors.")
         return super().__call__(query, key, value, score_mod, *other_buffers)
@@ -231,7 +231,7 @@ def templated_attention_functionalize(
             functional_score_mod,
             *other_buffers_unwrapped,
         )
-    return ctx.wrap_tensors(out)  # type: ignore[return-value]
+    return ctx.wrap_tensors(out)  # type: ignore[return-value, arg-type]
 
 
 @templated_attention.py_impl(FakeTensorMode)
@@ -251,18 +251,32 @@ def templated_attention_fake_tensor_mode(
         return torch.empty_like(query, memory_format=torch.contiguous_format), logsumexp
 
 
+def is_fake_tensor(t: torch.Tensor):
+    """Why not use is_fake in fake_tensor?
+
+    That is specifically designed to pick up on traceable wrapper subclasses so instead we
+    define this one off
+    """
+    from torch._subclasses.fake_tensor import FakeTensor
+    from torch._subclasses.functional_tensor import FunctionalTensor
+
+    return (
+        isinstance(t, torch.Tensor)
+        and isinstance(t, FunctionalTensor)
+        and torch._is_functional_tensor(t.elem)
+        and isinstance(torch._from_functional_tensor(t.elem), FakeTensor)
+    )
+
+
 # ---------------------------- Autograd Implementation ----------------------------
 def create_fw_bw_graph(score_mod, index_values, other_buffers):
     # See Note:[HOP create fw_bw graph]
 
     # All of these imports need to be here in order to avoid circular dependencies
     from torch._dispatch.python import suspend_functionalization
-    from torch._functorch.aot_autograd import AOTConfig, create_joint, from_fun
+    from torch._functorch.aot_autograd import AOTConfig, create_joint
 
-    from torch._subclasses.functional_tensor import (
-        disable_functional_mode,
-        FunctionalTensor,
-    )
+    from torch._subclasses.functional_tensor import disable_functional_mode
     from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
 
     dummy_aot_config = AOTConfig(
@@ -274,40 +288,31 @@ def create_fw_bw_graph(score_mod, index_values, other_buffers):
         aot_id=0,
         keep_inference_input_mutations=False,
     )
+    assert all(is_fake_tensor(t) for t in index_values), (
+        "Expected all index_values to create_fw_bw_graph to be FakeTensors! ",
+        "Ensure that FlexAttention was called with backend >= aot_eager",
+    )
+
+    assert all(is_fake_tensor(t) for t in other_buffers), (
+        "Expected all other_buffers to create_fw_bw_graph to be FakeTensors! ",
+        "Ensure that FlexAttention was called with backend >= aot_eager",
+    )
+
     with suspend_functionalization(), disable_functional_mode():
         with disable_proxy_modes_tracing():
 
             def _from_fun(t):
-                if isinstance(t, torch.Tensor):
-                    if t.dtype != torch.bool:
-                        # New empty is causing some bogus values to be attempted to index
-                        return torch.zeros(
-                            t.size(), dtype=t.dtype, requires_grad=t.requires_grad
-                        )
-                        return torch.empty_strided(
-                            t.size(),
-                            t.stride(),
-                            dtype=t.dtype,
-                            requires_grad=t.requires_grad,
-                        )
-                    else:
-                        # clone of a functional tensor produces a functional tensor
-                        # but we want to avoid it so we clone a non-functional version
-                        maybe_unfunc_t = t
-                        if isinstance(t, FunctionalTensor):
-                            torch._sync(t)
-                            maybe_unfunc_t = from_fun(t)
-                        elif torch._is_functional_tensor(t):
-                            # need to handle both types of functionalization here:
-                            # these are the tensors that came from the user,
-                            # which could be either FunctionalTensorWrapper or FunctionalTensor
-                            torch._sync(t)
-                            maybe_unfunc_t = torch._from_functional_tensor(t)
-                        return maybe_unfunc_t.clone()
-                return t
+                return torch.empty_strided(
+                    t.size(),
+                    t.stride(),
+                    device=t.device,
+                    dtype=t.dtype,
+                    requires_grad=t.requires_grad,
+                )
 
             unwrapped_score_mod_indexes = pytree.tree_map(_from_fun, index_values)
             unwrapped_other_buffers = pytree.tree_map(_from_fun, other_buffers)
+
             example_flat_out = pytree.tree_map(
                 _from_fun,
                 score_mod(*unwrapped_score_mod_indexes, *unwrapped_other_buffers),
@@ -388,10 +393,13 @@ def templated_attention_autograd(
     *other_buffers: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     input_requires_grad = any(t.requires_grad for t in (query, key, value))
-    example_vals = [
-        torch.zeros((), dtype=query.dtype, requires_grad=input_requires_grad)
-    ] + [torch.zeros((), dtype=torch.int) for _ in range(4)]
-    fw_graph, bw_graph = create_fw_bw_graph(score_mod, example_vals, other_buffers)
+    if torch.is_grad_enabled() and input_requires_grad:
+        example_vals = [
+            torch.zeros((), dtype=query.dtype, requires_grad=input_requires_grad)
+        ] + [torch.zeros((), dtype=torch.int) for _ in range(4)]
+        fw_graph, bw_graph = create_fw_bw_graph(score_mod, example_vals, other_buffers)
+    else:
+        fw_graph, bw_graph = score_mod, None
     out, logsumexp = TemplatedAttentionAutogradOp.apply(
         query, key, value, fw_graph, bw_graph, *other_buffers
     )
@@ -427,9 +435,11 @@ def sdpa_dense_backward(
     score_mod = torch.vmap(score_mod, in_dims=(0, None, 0, None, None) + in_dim_buffers)
     score_mod = torch.vmap(score_mod, in_dims=(0, 0, None, None, None) + in_dim_buffers)
 
-    scores = score_mod(scores, b, h, m, n, *other_buffers).to(working_precision)
+    post_mod_scores = score_mod(scores, b, h, m, n, *other_buffers).to(
+        working_precision
+    )
 
-    softmax_scores = torch.exp(scores - logsumexp.unsqueeze(-1))
+    softmax_scores = torch.exp(post_mod_scores - logsumexp.unsqueeze(-1))
 
     grad_value = softmax_scores.to(query.dtype).transpose(-2, -1) @ grad_out
 
@@ -440,7 +450,7 @@ def sdpa_dense_backward(
 
     # Gradient of the inline score_mod function, with respect to the scores
     in_dim_buffers = (None,) * len(other_buffers)
-    out_dims = [0, None, None, None, None]
+    out_dims = [0, None, None, None, None] + [None] * len(other_buffers)
     joint_score_mod = torch.vmap(
         joint_graph,
         in_dims=(0, None, None, None, 0, 0) + in_dim_buffers,
@@ -461,10 +471,10 @@ def sdpa_dense_backward(
         in_dims=(0, 0, None, None, None, 0) + in_dim_buffers,
         out_dims=out_dims,
     )
-
-    grad_scores = joint_score_mod(scores, b, h, m, n, grad_score_mod, *other_buffers)[
-        0
-    ].to(query.dtype)
+    grad_scores, *_ = joint_score_mod(
+        scores, b, h, m, n, grad_score_mod, *other_buffers
+    )
+    grad_scores = grad_scores.to(query.dtype)
 
     grad_query = grad_scores @ key
     grad_key = grad_scores.transpose(-2, -1) @ query
@@ -495,8 +505,7 @@ def trace_templated_attention_backward(
         joint_graph,
         *other_buffers,
     )
-    # TODO If I dont wrap the graph modules in functionalize I already have my graph modules..
-    # Ask Brian
+
     fw_example_vals = [
         torch.zeros((), dtype=query.dtype, requires_grad=query.requires_grad)
     ] + [torch.zeros((), dtype=torch.int) for _ in range(4)]

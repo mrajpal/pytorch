@@ -8,6 +8,8 @@ from unittest import skip, skipUnless
 from unittest.mock import patch
 
 import torch
+
+from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
 from torch._higher_order_ops.templated_attention import (
     templated_attention as templated_attention_hop,
 )
@@ -67,6 +69,10 @@ test_score_mods = [
 
 def _times_two(score, b, h, m, n):
     return score * 2
+
+
+def _squared(score, b, h, m, n):
+    return score * score
 
 
 B = 4
@@ -290,6 +296,14 @@ class TestTemplatedSDPA(InductorTestCase):
         def sdpa_hop(q, k, v, score_mod):
             return templated_attention_hop(q, k, v, score_mod)
 
+        @torch.compile(backend="aot_eager")
+        def eager_sdpa_hop(q, k, v, score_mod):
+            """The main entrypoint for FlexAttention doesnt return LSE.
+            Besides dropping LSE it also ensures that the hop is compiled with aot-eager
+            backend. We need to replicate this.
+            """
+            return templated_attention_hop(q, k, v, score_mod)
+
         make_tensor = functools.partial(
             torch.randn,
             (B, H, S, D),
@@ -299,7 +313,7 @@ class TestTemplatedSDPA(InductorTestCase):
         )
         q, k, v = make_tensor(), make_tensor(), make_tensor()
 
-        ref_out, ref_lse = templated_attention_hop(
+        ref_out, ref_lse = eager_sdpa_hop(
             q.to(torch.float64), k.to(torch.float64), v.to(torch.float64), score_mod
         )
         compiled_out, compiled_lse = sdpa_hop(q, k, v, score_mod)
@@ -373,7 +387,7 @@ class TestTemplatedSDPA(InductorTestCase):
         FileCheck().check_count(".run(", 2, True).run(code[0])
 
     @supported_platform
-    @common_utils.parametrize("score_mod", [_identity, _causal, _times_two])
+    @common_utils.parametrize("score_mod", [_identity, _causal, _times_two, _squared])
     def test_aot_eager_gradcheck(self, score_mod):
         make_tensor = functools.partial(
             torch.randn,
@@ -386,7 +400,129 @@ class TestTemplatedSDPA(InductorTestCase):
 
         func = torch.compile(_templated_attention, backend="aot_eager", fullgraph=True)
 
-        self.assertTrue(torch.autograd.gradcheck(func, (query, key, value, score_mod)))
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                func, (query, key, value, score_mod), raise_exception=True
+            )
+        )
+
+    @supported_platform
+    def test_captured_score_mod_aot_eager_gradcheck(self):
+        make_tensor = functools.partial(
+            torch.randn,
+            (2, 2, 8, 4),
+            device="cuda",
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        query, key, value = make_tensor(), make_tensor(), make_tensor()
+
+        func = torch.compile(_templated_attention, backend="aot_eager", fullgraph=True)
+
+        head_offset = torch.rand(H, device="cuda", dtype=torch.float64)
+
+        # Uses a lifted variable and creates correct joint graph is required for gradcheck
+        def score_mod(score, b, h, m, n):
+            return score * index(head_offset, [h])
+
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                func, (query, key, value, score_mod), raise_exception=True
+            )
+        )
+
+    @supported_platform
+    def test_fw_bw_graph_correctness(self):
+        cnt = CompileCounterWithBackend("aot_eager")
+        make_tensor = functools.partial(
+            torch.randn,
+            (2, 2, 8, 4),
+            device="cuda",
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        query, key, value = make_tensor(), make_tensor(), make_tensor()
+
+        func = torch.compile(_templated_attention, backend=cnt, fullgraph=True)
+        out = func(query, key, value, _squared)
+        out.sum().backward()
+        self.assertEqual(cnt.frame_count, 1)
+        self.assertEqual(len(cnt.graphs), 1)
+        graph = cnt.graphs[0]
+        norm_graph = normalize_gm(graph.print_readable(print_output=False))
+        self.assertExpectedInline(
+            norm_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_args_0_ : torch.Tensor, L_args_1_ : torch.Tensor, L_args_2_ : torch.Tensor):
+        l_args_0_ = L_args_0_
+        l_args_1_ = L_args_1_
+        l_args_2_ = L_args_2_
+
+        new_empty = l_args_0_.new_empty([], requires_grad = True)
+        new_empty_1 = l_args_0_.new_empty([], dtype = torch.int32)
+        new_empty_2 = l_args_0_.new_empty([], dtype = torch.int32)
+        new_empty_3 = l_args_0_.new_empty([], dtype = torch.int32)
+        new_empty_4 = l_args_0_.new_empty([], dtype = torch.int32)
+        templated_attention_0 = self.templated_attention_0
+        templated_attention = torch.ops.higher_order.templated_attention(l_args_0_, """
+            + """l_args_1_, l_args_2_, templated_attention_0);  l_args_0_ = l_args_1_ = l_args_2_ = templated_attention_0 = None
+        out = templated_attention[0];  templated_attention = None
+        return (out,)
+
+    class GraphModule(torch.nn.Module):
+        def forward(self, new_empty, new_empty_1, new_empty_2, new_empty_3, new_empty_4):
+            mul = new_empty * new_empty;  new_empty = None
+            return mul
+""",
+        )
+        # Save the AOT graphs
+        aot_graphs = []
+        from torch._inductor import compile_fx
+
+        def debug_compile_fx_inner(graph, example_inputs, *args, **kwargs):
+            aot_graphs.append(graph)
+            return graph
+
+        backend = functools.partial(
+            compile_fx.compile_fx, inner_compile=debug_compile_fx_inner
+        )
+        func = torch.compile(func, backend=backend, fullgraph=True)
+        out = func(query, key, value, _squared)
+        out.sum().backward()
+
+        joint_graph = normalize_gm(aot_graphs[1].print_readable(print_output=False))
+
+        self.assertExpectedInline(
+            joint_graph,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, primals_1: "f64[2, 2, 8, 4]", primals_2: "f64[2, 2, 8, 4]", primals_3: "f64[2, 2, 8, 4]", """
+            + """alias_5: "f64[2, 2, 8, 4]", alias_7: "f32[2, 2, 8]", tangents_1: "f64[2, 2, 8, 4]"):
+        fw_graph = self.fw_graph
+        joint_graph = self.joint_graph
+        templated_attention_backward = torch.ops.higher_order.templated_attention_backward(primals_1, primals_2, """
+            + """primals_3, alias_5, alias_7, tangents_1, fw_graph, joint_graph);  primals_1 = primals_2 = primals_3 = alias_5 """
+            + """= alias_7 = tangents_1 = fw_graph = joint_graph = None
+        getitem_2: "f64[2, 2, 8, 4]" = templated_attention_backward[0]
+        getitem_3: "f64[2, 2, 8, 4]" = templated_attention_backward[1]
+        getitem_4: "f64[2, 2, 8, 4]" = templated_attention_backward[2];  templated_attention_backward = None
+        return [getitem_2, getitem_3, getitem_4]
+
+    class <lambda>(torch.nn.Module):
+        def forward(self, arg0_1: "f64[]", arg1_1: "i32[]", arg2_1: "i32[]", arg3_1: "i32[]", arg4_1: "i32[]"):
+            mul: "f64[]" = torch.ops.aten.mul.Tensor(arg0_1, arg0_1);  arg0_1 = None
+            return mul
+
+    class <lambda>(torch.nn.Module):
+        def forward(self, arg0_1: "f64[]", arg1_1: "i32[]", arg2_1: "i32[]", arg3_1: "i32[]", arg4_1: "i32[]", arg5_1: "f64[]"):
+            mul: "f64[]" = torch.ops.aten.mul.Tensor(arg0_1, arg0_1)
+            mul_1: "f64[]" = torch.ops.aten.mul.Tensor(arg5_1, arg0_1)
+            mul_2: "f64[]" = torch.ops.aten.mul.Tensor(arg5_1, arg0_1);  arg5_1 = arg0_1 = None
+            add: "f64[]" = torch.ops.aten.add.Tensor(mul_2, mul_1);  mul_2 = mul_1 = None
+            return [add, None, None, None, None]
+""",
+        )
 
 
 common_utils.instantiate_parametrized_tests(TestTemplatedSDPA)

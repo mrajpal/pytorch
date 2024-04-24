@@ -1,6 +1,6 @@
 """This module implements the user facing API for templated attention in PyTorch."""
 import functools
-from typing import Callable, Tuple
+from typing import Callable
 
 import torch
 from torch._higher_order_ops.templated_attention import (
@@ -35,7 +35,7 @@ def _templated_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     score_mod: _score_mod_signature,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     r"""This function implements scaled dot product attention with an arbitrary attention score modification function.
 
     This function computes the scaled dot product attention between query, key, and value tensors with a user-defined
@@ -103,7 +103,7 @@ def _templated_attention(
         with torch._dynamo.utils.disable_cache_limit():
             with _temp_remove_pre_dispatch_torch_function_mode():
                 out, _ = torch.compile(
-                    templated_attention_hop, backend="eager", fullgraph=True
+                    templated_attention_hop, backend="aot_eager", fullgraph=True
                 )(query, key, value, score_mod)
                 return out
 
