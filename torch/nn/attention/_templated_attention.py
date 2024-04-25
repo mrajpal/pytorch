@@ -103,7 +103,7 @@ def _templated_attention(
         with torch._dynamo.utils.disable_cache_limit():
             with _temp_remove_pre_dispatch_torch_function_mode():
                 out, _ = torch.compile(
-                    templated_attention_hop, backend="aot_eager", fullgraph=True
+                    templated_attention_hop, backend="eager", fullgraph=True
                 )(query, key, value, score_mod)
                 return out
 

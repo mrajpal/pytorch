@@ -66,14 +66,59 @@ test_score_mods = [
     _generate_alibi_bias(8),
 ]
 
+# --------- Useful score mod functions for testing ---------
+
 
 def _times_two(score, b, h, m, n):
+    """Joint graph needed for correctness"""
     return score * 2
 
 
 def _squared(score, b, h, m, n):
+    """Joint graph needed for correctness"""
     return score * score
 
+
+def _head_offset(dtype: torch.dtype):
+    """Captured Buffer
+    Note: this builds a score_mod with index of a type
+    """
+    head_offset = torch.rand(H, device="cuda", dtype=dtype)
+
+    def score_mod(score, b, h, m, n):
+        return score * index(head_offset, [h])
+
+    return score_mod
+
+
+def _trig(score, b, h, m, n):
+    """Joint graph needed for correctness"""
+    return torch.sin(torch.cos(score)) + torch.tan(b)
+
+
+def _trig2(score, b, h, m, n):
+    """Branching joint graph"""
+    cos_score = torch.cos(score)
+    sin_score = torch.sin(score)
+    z = cos_score * sin_score + torch.tan(b)
+    return z
+
+
+def _buffer_reduced(dtype: torch.dtype):
+    """Reduction in captured buffer"""
+    batch_offsets = torch.rand(B, 8, device="cuda", dtype=dtype)
+
+    def score_mod(score, b, h, m, n):
+        batch_vals = index(batch_offsets, [b])
+        return score + batch_vals.sum()
+
+    return score_mod
+
+
+captured_buffers_map = {
+    "_head_offset": _head_offset,
+    "_buffer_reduced": _buffer_reduced,
+}
 
 B = 4
 H = 8
@@ -387,7 +432,9 @@ class TestTemplatedSDPA(InductorTestCase):
         FileCheck().check_count(".run(", 2, True).run(code[0])
 
     @supported_platform
-    @common_utils.parametrize("score_mod", [_identity, _causal, _times_two, _squared])
+    @common_utils.parametrize(
+        "score_mod", [_identity, _causal, _times_two, _squared, _trig, _trig2]
+    )
     def test_aot_eager_gradcheck(self, score_mod):
         make_tensor = functools.partial(
             torch.randn,
@@ -407,7 +454,8 @@ class TestTemplatedSDPA(InductorTestCase):
         )
 
     @supported_platform
-    def test_captured_score_mod_aot_eager_gradcheck(self):
+    @common_utils.parametrize("score_mod_name", ["_head_offset", "_buffer_reduced"])
+    def test_captured_score_mod_aot_eager_gradcheck(self, score_mod_name: str):
         make_tensor = functools.partial(
             torch.randn,
             (2, 2, 8, 4),
@@ -418,12 +466,7 @@ class TestTemplatedSDPA(InductorTestCase):
         query, key, value = make_tensor(), make_tensor(), make_tensor()
 
         func = torch.compile(_templated_attention, backend="aot_eager", fullgraph=True)
-
-        head_offset = torch.rand(H, device="cuda", dtype=torch.float64)
-
-        # Uses a lifted variable and creates correct joint graph is required for gradcheck
-        def score_mod(score, b, h, m, n):
-            return score * index(head_offset, [h])
+        score_mod = captured_buffers_map[score_mod_name](torch.float64)
 
         self.assertTrue(
             torch.autograd.gradcheck(
