@@ -1318,7 +1318,8 @@ class ExportedProgramSerializer(metaclass=Final):
                 major=SCHEMA_VERSION[0],
                 minor=SCHEMA_VERSION[1],
             ),
-            dialect=exported_program.dialect
+            dialect=exported_program.dialect,
+            disable_forced_specializations=exported_program._disable_forced_specializations
         )
 
         # Test canonical form is well defined.
@@ -2202,6 +2203,7 @@ class ExportedProgramDeserializer(metaclass=Final):
             example_inputs=res.example_inputs,
             verifier=load_verifier(exported_program.dialect),
             constants=res.constants,
+            disable_forced_specializations=exported_program.disable_forced_specializations,
         )
         return upgrader.upgrade(exported_program)
 
@@ -2814,5 +2816,6 @@ def canonicalize(ep: ExportedProgram) -> ExportedProgram:
         opset_version=opset_version,
         range_constraints=range_constraints,
         schema_version=ep.schema_version,
-        dialect=ep.dialect
+        dialect=ep.dialect,
+        disable_forced_specializations=ep.disable_forced_specializations,
     )

@@ -215,6 +215,7 @@ class ExportedProgram:
         constants: Optional[
             Dict[str, Union[torch.Tensor, torch._C.ScriptObject]]
         ] = None,
+        disable_forced_specializations: Optional[bool] = False,
     ):
         # Remove codegen related things from the graph. It should just be a flat graph.
         graph._codegen = torch.fx.graph.CodeGen()
@@ -228,6 +229,7 @@ class ExportedProgram:
         assert module_call_graph is not None
         self._module_call_graph: List[ModuleCallEntry] = module_call_graph
         self._example_inputs = example_inputs
+        self._disable_forced_specializations = disable_forced_specializations
 
         self._constants = tensor_constants or constants or {}
         assert self._constants is not None
@@ -679,6 +681,7 @@ class ExportedProgram:
             example_inputs=self.example_inputs,
             verifier=self.verifier,
             constants=self.constants,
+            disable_forced_specializations=self._disable_forced_specializations,
         )
         return exported_program
 
@@ -770,6 +773,7 @@ class ExportedProgram:
             example_inputs=self.example_inputs,
             verifier=self.verifier,
             constants=self.constants,
+            disable_forced_specializations=self._disable_forced_specializations,
         )
         transformed_ep.graph_module.meta.update(self.graph_module.meta)
         transformed_ep.graph_module.meta.update(res.graph_module.meta)
@@ -785,7 +789,10 @@ class ExportedProgram:
             if s.kind == InputKind.USER_INPUT
         ]
         _check_input_constraints_for_graph(
-            input_placeholders, flat_args_with_path, self.range_constraints
+            input_placeholders,
+            flat_args_with_path,
+            self.range_constraints,
+            self._disable_forced_specializations,
         )
 
     def _validate(self):
@@ -805,6 +812,7 @@ class ExportedProgram:
             example_inputs=self.example_inputs,
             verifier=self.verifier,
             tensor_constants=self.tensor_constants,
+            disable_forced_specializations=self._disable_forced_specializations,
         )
 
 

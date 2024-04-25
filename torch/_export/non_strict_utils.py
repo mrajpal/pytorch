@@ -1,6 +1,6 @@
 import inspect
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch._dynamo.source import (
@@ -200,6 +200,7 @@ def produce_guards_and_solve_constraints(
     gm: torch.fx.GraphModule,
     equalities_inputs: EqualityConstraint,
     original_signature: inspect.Signature,
+    disable_forced_specializations: Optional[bool] = False,
 ):
     """
     Given a fake mode, sources pairs corresponding to equal dynamic shape dimensions,
@@ -210,6 +211,7 @@ def produce_guards_and_solve_constraints(
     Additional inputs:
         equalities_inputs: the equality constraints to use for guards
         original_signature: the signature of the forward method
+        disable_forced_specializations: if True, avoids forced specializations
     """
     shape_env = fake_mode.shape_env
     assert shape_env.tracked_fakes is not None
@@ -225,6 +227,7 @@ def produce_guards_and_solve_constraints(
             input_contexts=input_contexts,
             equalities_inputs=equalities_inputs,
             ignore_static=False,
+            disable_forced_specializations=disable_forced_specializations,
         )
     except ConstraintViolationError as e:
         constraint_violation_error = e
@@ -237,7 +240,7 @@ def produce_guards_and_solve_constraints(
         # TODO(avik): Maybe record the constraint violation error instead and replay later?
         assert constraint_violation_error
         raise constraint_violation_error
-    dim_constraints.solve()
+    dim_constraints.solve(disable_forced_specializations=disable_forced_specializations)
     dim_constraints.remove_redundant_dynamic_results()
     forced_specializations = dim_constraints.forced_specializations()
     msg = dim_constraints.prettify_results(

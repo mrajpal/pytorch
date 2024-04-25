@@ -1692,7 +1692,12 @@ class DimConstraints:
             if s not in self._substitutions
         }
 
-    def solve(self, disable_congruences=True, disable_equivalences=True):
+    def solve(
+        self,
+        disable_congruences=True,
+        disable_equivalences=True,
+        disable_forced_specializations=False,
+    ):
         """Solve the system of constraint equations to find simplified constraints
         """
         self._raise_inconsistencies()
@@ -1719,7 +1724,8 @@ class DimConstraints:
                 self.add(expr.xreplace({s: self._substitutions[s]}))
             self._raise_inconsistencies()
 
-        self._specialize_divisor_symbols()
+        if not disable_forced_specializations:
+            self._specialize_divisor_symbols()
 
         # solve linear congruences
         # NOTE(avik): We do not need to solve them for symbols that have already been specialized.
@@ -1737,8 +1743,9 @@ class DimConstraints:
                         r = try_solve(sympy.Eq(base, divisor * tmp), s)
                         self._dynamic_results.add(self._dcp.doprint(sympy.Eq(s, r[1])))
                     elif disable_congruences:
-                        self._force_specialization(s)
-                        self._univariate_inequalities.pop(s, None)
+                        if not disable_forced_specializations:
+                            self._force_specialization(s)
+                            self._univariate_inequalities.pop(s, None)
 
         # remaining symbols have only pure inequalities (no equalities)
         for s, exprs in self._univariate_inequalities.items():
@@ -1763,9 +1770,10 @@ class DimConstraints:
         for source, expr in symbolic_equivalences:
             if disable_equivalences and not self._is_supported_equivalence(expr):
                 for s in expr.free_symbols:
-                    self._force_specialization(s)
-                    sexpr = self._dcp._print_Symbol(s)
-                    self._dynamic_results = {r for r in self._dynamic_results if sexpr not in r}
+                    if not disable_forced_specializations:
+                        self._force_specialization(s)
+                        sexpr = self._dcp._print_Symbol(s)
+                        self._dynamic_results = {r for r in self._dynamic_results if sexpr not in r}
             self.add_equality(source, expr.xreplace(self._substitutions))
 
         # remaining symbolic equivalences become dynamic equality constraints
@@ -1928,7 +1936,7 @@ class DimConstraints:
                         others.append(f"{k} = None  # {other}")
                     elif self._is_supported_equivalence(other):
                         s = next(iter(other.free_symbols))
-                        if s not in results:
+                        if str(s) not in results:
                             modulus, remainder = sympy.polys.polytools.div(other, s)
                             c_min = c.get("min", 2)
                             min_ = math.ceil((c_min - remainder) / modulus)
@@ -3217,6 +3225,7 @@ class ShapeEnv:
         equalities_inputs: Optional[EqualityConstraint] = None,
         _simplified=False,
         # Indicates if we should produce guards for known static values.
+        disable_forced_specializations=False,
         ignore_static=True,
     ) -> List[str]:
         """
@@ -3638,12 +3647,13 @@ class ShapeEnv:
                     constraints = symbol_to_constraints[symbol]
                     for c in constraints:
                         if isinstance(c, StrictMinMaxConstraint):
-                            var_with_range = self._render_range_for_constraint_violation(source, c)
-                            msg = (
-                                f"Not all values of {var_with_range} "
-                                f"satisfy the generated guard {guard_expr}."
-                            )
-                            record_constraint_violation(c.warn_only, self._debug_name(source), msg)
+                            if not disable_forced_specializations:
+                                var_with_range = self._render_range_for_constraint_violation(source, c)
+                                msg = (
+                                    f"Not all values of {var_with_range} "
+                                    f"satisfy the generated guard {guard_expr}."
+                                )
+                                record_constraint_violation(c.warn_only, self._debug_name(source), msg)
                         elif isinstance(c, RelaxedUnspecConstraint):
                             # This is fine, we allow guards here as long as it
                             # didn't constrain it to one value  (we don't

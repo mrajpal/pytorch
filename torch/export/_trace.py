@@ -851,6 +851,7 @@ def _export(
     strict: bool = True,
     preserve_module_call_signature: Tuple[str, ...] = (),
     pre_dispatch: bool = False,
+    disable_forced_specializations: Optional[bool] = False,
 ) -> ExportedProgram:
     """
     Traces either an nn.Module's forward function or just a callable with PyTorch
@@ -881,6 +882,14 @@ def _export(
         preserve_module_call_signature: A list of submodule paths for which the original
             calling conventions are preserved as metadata.
 
+        disable_forced_specializations:
+         By default, some inferred dynamic shapes guards/constraints that are not expressible with the current
+         dynamic shapes language will lead to specialization to the concrete input values provided.
+         If disable_forced_specializations is set to True, we will not specialize, and will not perform runtime
+         checks on such produced guards. Instead, we allow the user to specify arbitrary shapes,
+         and fail during runtime if the inputs are invalid. Constraints expressible with the language
+         (e.g. ranges, linear derived dims) will still be enforced.
+
     Returns:
         An ExportedProgram containing the traced method.
     """
@@ -890,6 +899,12 @@ def _export(
         raise UserError(
             UserErrorType.INVALID_INPUT,
             f"Expecting `args` to be a tuple of example positional inputs, got {type(args)}",
+        )
+
+    if disable_forced_specializations and strict:
+        raise UserError(
+            UserErrorType.INVALID_INPUT,
+            "disable_forced_specializations can be only be specified in non-strict mode.",
         )
 
     global _EXPORT_FLAGS, _EXPORT_MODULE_HIERARCHY
@@ -1018,6 +1033,7 @@ def _export(
                 ep_non_strict.gm,
                 equalities_inputs,
                 original_signature,
+                disable_forced_specializations=disable_forced_specializations,
             )
         except (ConstraintViolationError, ValueRangeError) as e:
             raise UserError(UserErrorType.CONSTRAINT_VIOLATION, str(e))  # noqa: TRY200
@@ -1076,6 +1092,7 @@ def _export(
             ),
             example_inputs=(args, kwargs),
             constants=ep_non_strict.constants,
+            disable_forced_specializations=disable_forced_specializations,
         )
         insert_deferred_runtime_asserts(
             exported_program.graph_module,
