@@ -1023,6 +1023,32 @@ def use_cutlass_template(layout, m, n, k):
     return res
 
 
+def _use_template_for_cpu(layout):
+    return use_max_autotune() and layout.device.type == "cpu"
+
+
+def use_cpp_packed_gemm_template(layout, mat1, mat2):
+    from . import ir
+    from .codegen.cpp_micro_gemm import create_micro_gemm
+    from .kernel.mm_common import mm_args
+
+    layout_dtypes = [torch.float32]
+    m, n, k, *_ = mm_args(mat1, mat2)
+    if isinstance(mat2, ir.BaseView):
+        mat2 = mat2.unwrap_view()
+    # TODO: support n % n_block_size != 0
+    _, n0, _ = create_micro_gemm(
+        "micro_gemm", m, n, k, layout.dtype, num_threads=parallel_num_threads()
+    ).register_blocking
+    return (
+        _use_template_for_cpu(layout)
+        and layout.dtype in layout_dtypes
+        and n % n0 == 0
+        and isinstance(mat2, ir.StorageBox)
+        and mat2.is_module_buffer()
+    )
+
+
 def use_aten_gemm_kernels():
     return not use_max_autotune() or _use_autotune_backend("ATEN")
 
